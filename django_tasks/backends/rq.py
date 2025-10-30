@@ -259,10 +259,24 @@ class RQBackend(BaseTaskBackend):
     def _get_queues(self) -> list[django_rq.queues.DjangoRQ]:
         return django_rq.queues.get_queues(*self.queues, job_class=Job)  # type: ignore[no-any-return,no-untyped-call]
 
+    def _get_default_task_queue_name(self) -> str:
+        task_queue_name = None
+        for task_queue_name in self.queues:
+            break
+
+        assert task_queue_name is not None, "No queues configured for RQ backend"
+        return task_queue_name
+
     def _get_job(self, result_id: str) -> Job | None:
+        default_task_queue_name = self._get_default_task_queue_name()
+
         try:
             return cast(
-                Job, Job.fetch(result_id, connection=django_rq.get_connection())
+                Job,
+                Job.fetch(
+                    result_id,
+                    connection=django_rq.get_connection(default_task_queue_name),
+                ),
             )
         except NoSuchJobError:
             return None

@@ -96,6 +96,15 @@ class BaseTaskBackend(metaclass=ABCMeta):
                 f"priority must be a whole number between {TASK_MIN_PRIORITY} and {TASK_MAX_PRIORITY}."
             )
 
+        if task.job_timeout is not None and (
+            isinstance(task.job_timeout, bool)
+            or not isinstance(task.job_timeout, int)
+            or task.job_timeout <= 0
+        ):
+            raise InvalidTaskError(
+                "job_timeout must be a positive whole number of seconds."
+            )
+
         if not self.supports_defer and task.run_after is not None:
             raise InvalidTaskError("Backend does not support run_after.")
 

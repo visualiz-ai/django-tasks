@@ -1,7 +1,8 @@
 import json
 import os
 import uuid
-from typing import cast
+from datetime import timedelta
+from typing import Any, cast
 from unittest.mock import patch
 
 import django_rq
@@ -10,8 +11,11 @@ from django.core.exceptions import SuspiciousOperation
 from django.db import transaction
 from django.test import TransactionTestCase, modify_settings, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from fakeredis import FakeRedis, FakeStrictRedis
 from rq.defaults import UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
+from rq.job import JobStatus
+from rq.queue import Queue
 from rq.timeouts import TimerDeathPenalty
 
 from django_tasks import TaskResultStatus, default_task_backend, task_backends
@@ -132,6 +136,59 @@ class RQBackendTestCase(TransactionTestCase):
                 self.assertEqual(result.args, [])
                 self.assertEqual(result.kwargs, {})
                 self.assertEqual(result.attempts, 0)
+
+    def test_enqueue_task_with_job_timeout(self) -> None:
+        result = test_tasks.noop_task.using(job_timeout=5).enqueue()
+
+        self.assertEqual(result.task.job_timeout, 5)
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        # The bound survives `Queue.enqueue_job` and the round-trip through Redis.
+        self.assertEqual(job.timeout, 5)
+
+    def test_enqueue_deferred_task_with_job_timeout(self) -> None:
+        result = test_tasks.noop_task.using(
+            job_timeout=5, run_after=timezone.now() + timedelta(hours=1)
+        ).enqueue()
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        # The bound also survives the `Queue.schedule_job` (run_after) path.
+        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
+        self.assertEqual(job.timeout, 5)
+
+    def test_enqueue_task_without_job_timeout(self) -> None:
+        queue = django_rq.get_queue("default", job_class=Job)
+
+        # The queue configures no timeout of its own, so RQ's default applies.
+        self.assertEqual(queue._default_timeout, Queue.DEFAULT_TIMEOUT)
+
+        result = test_tasks.noop_task.enqueue()
+
+        self.assertIsNone(result.task.job_timeout)
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        self.assertEqual(job.timeout, queue._default_timeout)
+
+    def test_invalid_job_timeout(self) -> None:
+        job_timeouts: list[Any] = [0, -1, "5"]
+
+        for job_timeout in job_timeouts:
+            with self.subTest(job_timeout):
+                with self.assertRaisesMessage(
+                    InvalidTaskError,
+                    "job_timeout must be a positive whole number of seconds",
+                ):
+                    # The Task is validated as it's created, so this never
+                    # reaches the queue.
+                    test_tasks.noop_task.using(job_timeout=job_timeout).enqueue()
+
+        self.assertEqual(django_rq.get_queue("default", job_class=Job).count, 0)
 
     def test_catches_exception(self) -> None:
         test_data = [

@@ -76,6 +76,14 @@ modified_task = calculate_meaning_of_life.using(priority=10)
 
 In addition to the above attributes, `run_after` can be passed to specify a specific time the task should run.
 
+`job_timeout` can also be passed to limit how long the task is allowed to run for, in seconds:
+
+```python
+bounded_task = calculate_meaning_of_life.using(job_timeout=30)
+```
+
+If it's not set, the backend's own default applies. Backends which have no concept of a per-task timeout (the database and immediate backends) ignore it.
+
 #### Task context
 
 Sometimes the running task may need to know context about how it was enqueued. To receive the task context as an argument to your task function, pass `takes_context` to the decorator and ensure the task takes a `context` as the first argument.
@@ -293,6 +301,10 @@ To use `rq` with `django-tasks`, a custom `Job` class must be used. This can be 
 ```shell
 ./manage.py rqworker --job-class django_tasks.backends.rq.Job
 ```
+
+### Job timeout
+
+`task.job_timeout` is passed to `rq` as the job's `timeout`, so a task which is still running after that many seconds is killed by the worker and the result is `FAILED`. Tasks which don't set one get the queue's `DEFAULT_TIMEOUT` (from `RQ_QUEUES`), and failing that `rq`'s own default of 180 seconds.
 
 ### Priorities
 

@@ -232,6 +232,8 @@ class RQBackend(BaseTaskBackend):
             kwargs=kwargs,
             job_id=task_result.id,
             status=JobStatus.SCHEDULED if task.run_after else JobStatus.QUEUED,
+            # `None` leaves RQ to apply the queue's own default timeout.
+            timeout=task.job_timeout,
             on_failure=Callback(failed_callback),
             on_success=Callback(success_callback),
             meta={"backend_name": self.alias},

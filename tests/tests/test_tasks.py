@@ -143,7 +143,11 @@ class TaskTestCase(SimpleTestCase):
 
     def test_backend_without_job_timeout_support_ignores_it(self) -> None:
         # Neither the dummy nor the immediate backend has a per-job bound: they
-        # accept a Task carrying one, and run it as they always would.
+        # accept a Task carrying one, and run it as they always would. A caller
+        # which needs the bound enforced has to ask.
+        self.assertFalse(default_task_backend.supports_job_timeout)
+        self.assertFalse(task_backends["immediate"].supports_job_timeout)
+
         result = test_tasks.noop_task.using(job_timeout=5).enqueue()
 
         self.assertEqual(result.status, TaskResultStatus.READY)
@@ -381,6 +385,8 @@ class DatabaseBackendJobTimeoutTestCase(TransactionTestCase):
         The database backend has no per-job timeout: enqueueing a Task which
         declares one works, and the bound simply isn't stored.
         """
+        self.assertFalse(default_task_backend.supports_job_timeout)
+
         result = test_tasks.noop_task.using(job_timeout=5).enqueue()
 
         self.assertEqual(result.status, TaskResultStatus.READY)

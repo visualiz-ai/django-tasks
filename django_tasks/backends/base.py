@@ -43,6 +43,15 @@ class BaseTaskBackend(metaclass=ABCMeta):
     supports_priority = False
     """Does the backend support tasks being executed in a given priority order?"""
 
+    supports_job_timeout = False
+    """
+    Does the backend enforce a Task's `job_timeout`?
+
+    A backend which doesn't still accepts a Task carrying one, and silently
+    ignores the bound - so a caller which depends on it has to assert on this
+    (and see the RQ backend's documentation for what it enforces, exactly).
+    """
+
     def __init__(self, alias: str, params: dict) -> None:
         from django_tasks import DEFAULT_TASK_QUEUE_NAME
 
@@ -96,10 +105,14 @@ class BaseTaskBackend(metaclass=ABCMeta):
                 f"priority must be a whole number between {TASK_MIN_PRIORITY} and {TASK_MAX_PRIORITY}."
             )
 
-        if task.job_timeout is not None and (
-            isinstance(task.job_timeout, bool)
-            or not isinstance(task.job_timeout, int)
-            or task.job_timeout <= 0
+        # `django.tasks.base.Task` has no `job_timeout`, and this backend must
+        # keep accepting one (see `django_tasks.compat.TASK_CLASSES`).
+        job_timeout = getattr(task, "job_timeout", None)
+
+        if job_timeout is not None and (
+            isinstance(job_timeout, bool)
+            or not isinstance(job_timeout, int)
+            or job_timeout <= 0
         ):
             raise InvalidTaskError(
                 "job_timeout must be a positive whole number of seconds."

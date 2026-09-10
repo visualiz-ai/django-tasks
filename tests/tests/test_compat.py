@@ -6,6 +6,7 @@ from django.test import SimpleTestCase, override_settings
 from django_tasks import compat, task_backends
 from django_tasks.backends.immediate import ImmediateBackend
 from django_tasks.base import Task
+from tests import tasks as test_tasks
 
 HAS_DJANGO_TASKS = VERSION >= (6, 0)
 
@@ -40,6 +41,26 @@ class DjangoCompatTestCase(SimpleTestCase):
             }
         ):
             self.assertIsInstance(task_backends["default"], ImmediateBackend)
+
+    @skipUnless(HAS_DJANGO_TASKS, "Requires django.tasks")
+    @override_settings(
+        TASKS={
+            "default": {"BACKEND": "django_tasks.backends.immediate.ImmediateBackend"}
+        }
+    )
+    def test_lib_backend_validates_django_task(self) -> None:
+        """
+        A `django.tasks` Task has none of this library's own Task attributes, so
+        validating one must only rely on what both classes have.
+        """
+        from django.tasks.base import Task as DjangoTask
+
+        # Constructing it validates it against the configured (lib) backend.
+        django_task: DjangoTask = DjangoTask(func=test_tasks.noop_task.func)
+
+        self.assertFalse(hasattr(django_task, "job_timeout"))
+
+        task_backends["default"].validate_task(django_task)  # type: ignore[arg-type]
 
     def test_compat_has_django_task(self) -> None:
         self.assertIn(Task, compat.TASK_CLASSES)

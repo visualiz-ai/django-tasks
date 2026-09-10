@@ -19,9 +19,10 @@ from rq.queue import Queue
 from rq.timeouts import TimerDeathPenalty
 
 from django_tasks import TaskResultStatus, default_task_backend, task_backends
-from django_tasks.backends.rq import Job, RQBackend
-from django_tasks.base import Task
+from django_tasks.backends.rq import Job, RQBackend, Worker
+from django_tasks.base import Task, TaskResult
 from django_tasks.exceptions import InvalidTaskError, TaskResultDoesNotExist
+from django_tasks.signals import task_finished
 from tests import tasks as test_tasks
 
 
@@ -138,6 +139,8 @@ class RQBackendTestCase(TransactionTestCase):
                 self.assertEqual(result.attempts, 0)
 
     def test_enqueue_task_with_job_timeout(self) -> None:
+        self.assertTrue(default_task_backend.supports_job_timeout)
+
         result = test_tasks.noop_task.using(job_timeout=5).enqueue()
 
         self.assertEqual(result.task.job_timeout, 5)
@@ -174,6 +177,74 @@ class RQBackendTestCase(TransactionTestCase):
         assert job is not None
 
         self.assertEqual(job.timeout, queue._default_timeout)
+
+    def collect_task_finished(self) -> list[TaskResult]:
+        """
+        Collect the `task_result` of every `task_finished` sent from here on.
+        """
+        finished: list[TaskResult] = []
+
+        def on_task_finished(
+            sender: Any, task_result: TaskResult, **kwargs: Any
+        ) -> None:
+            finished.append(task_result)
+
+        task_finished.connect(on_task_finished, weak=False)
+        self.addCleanup(task_finished.disconnect, on_task_finished)
+
+        return finished
+
+    def test_killed_work_horse_sends_task_finished(self) -> None:
+        """
+        A work horse killed by the `job_timeout + 60` backstop never runs the
+        job's failure callback, so `Worker` has to send `task_finished` itself.
+        """
+        result = test_tasks.noop_task.using(job_timeout=1).enqueue()
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        queue = django_rq.get_queue("default", job_class=Job)
+        worker = Worker([queue], connection=queue.connection, prepare_for_work=False)
+
+        self.assertIs(worker.job_class, Job)
+
+        finished = self.collect_task_finished()
+
+        with (
+            self.assertLogs("rq.worker", level="WARNING"),
+            self.assertLogs("django_tasks", level="ERROR") as logs,
+        ):
+            # As `monitor_work_horse` calls it, having SIGKILLed the horse.
+            worker.handle_work_horse_killed(job, os.getpid(), -9, None)
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].id, result.id)
+        self.assertEqual(finished[0].status, TaskResultStatus.FAILED)
+
+        # The library's own `task_finished` receiver saw it, too.
+        self.assertIn("state=FAILED", logs.output[0])
+
+    def test_killed_work_horse_of_unknown_job_is_logged(self) -> None:
+        """
+        A worker which has just lost a horse keeps working, whatever the job it
+        was running turns out to be.
+        """
+        queue = django_rq.get_queue("default")
+        job = queue.create_job("tests.tasks.noop_task")
+
+        worker = Worker([queue], connection=queue.connection, prepare_for_work=False)
+
+        finished = self.collect_task_finished()
+
+        with (
+            self.assertLogs("rq.worker", level="WARNING"),
+            self.assertLogs("django_tasks.backends.rq", level="ERROR") as logs,
+        ):
+            worker.handle_work_horse_killed(job, os.getpid(), -9, None)
+
+        self.assertIn("Unable to report the killed work horse", logs.output[0])
+        self.assertEqual(finished, [])
 
     def test_invalid_job_timeout(self) -> None:
         job_timeouts: list[Any] = [0, -1, "5"]

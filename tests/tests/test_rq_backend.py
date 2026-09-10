@@ -65,11 +65,15 @@ class RQBackendTestCase(TransactionTestCase):
     def setUp(self) -> None:
         super().setUp()
 
-        fake_connection_patcher = patch(
-            "django_rq.queues.get_redis_connection", get_fake_connection
-        )
-        fake_connection_patcher.start()
-        self.addCleanup(fake_connection_patcher.stop)
+        for target in (
+            "django_rq.queues.get_redis_connection",
+            # django-rq >= 4.1 resolves `django_rq.get_connection` through
+            # `connection_utils`, which doesn't go through `queues`.
+            "django_rq.connection_utils.get_redis_connection",
+        ):
+            fake_connection_patcher = patch(target, get_fake_connection)
+            fake_connection_patcher.start()
+            self.addCleanup(fake_connection_patcher.stop)
 
         django_rq.get_connection().flushall()
 

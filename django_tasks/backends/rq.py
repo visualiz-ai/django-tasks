@@ -7,7 +7,7 @@ from typing import Any, TypeVar, cast
 import django_rq
 from django.apps import apps
 from django.core.checks import messages
-from django.core.exceptions import SuspiciousOperation
+from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.db import transaction
 from django.utils.functional import cached_property
 from redis.client import Redis
@@ -311,12 +311,14 @@ class RQBackend(BaseTaskBackend):
         return django_rq.queues.get_queues(*self.queues, job_class=Job)  # type: ignore[no-any-return,no-untyped-call]
 
     def _get_default_task_queue_name(self) -> str:
-        task_queue_name = None
-        for task_queue_name in self.queues:
-            break
+        # `self.queues` is a set, so "the first one" is whichever the set
+        # yields first - the same choice the previous for/break made.
+        task_queue_name = next(iter(self.queues), None)
 
-        assert task_queue_name is not None, "No queues configured for RQ backend"
-        return task_queue_name
+        if task_queue_name is None:
+            raise ImproperlyConfigured("No queues configured for RQ backend")
+
+        return str(task_queue_name)
 
     def _get_job(self, result_id: str) -> Job | None:
         default_task_queue_name = self._get_default_task_queue_name()

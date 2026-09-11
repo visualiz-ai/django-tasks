@@ -1,7 +1,7 @@
 import datetime
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 
 import django
 from django.conf import settings
@@ -50,13 +50,24 @@ else:
             return cls
 
 
+# `CheckConstraint.check` was renamed to `condition` in Django 5.1. Pass the
+# version-dependent keyword through a dict so neither name is type-checked
+# against the stubs for the other version.
+PRIORITY_RANGE_CONDITION = Q(priority__range=(TASK_MIN_PRIORITY, TASK_MAX_PRIORITY))
+PRIORITY_CONSTRAINT_KWARGS: dict[str, Any] = (
+    {"condition": PRIORITY_RANGE_CONDITION}
+    if django.VERSION >= (5, 1)
+    else {"check": PRIORITY_RANGE_CONDITION}
+)
+
+
 def get_date_max() -> datetime.datetime:
     return datetime.datetime(
         9999, 1, 1, tzinfo=datetime.timezone.utc if settings.USE_TZ else None
     )
 
 
-class DBTaskResultQuerySet(models.QuerySet):
+class DBTaskResultQuerySet(models.QuerySet["DBTaskResult"]):
     def ready(self) -> "DBTaskResultQuerySet":
         """
         Return tasks which are ready to be processed.
@@ -137,20 +148,9 @@ class DBTaskResult(GenericBase[P, T], models.Model):
             models.Index(fields=["backend_name"]),
         ]
 
-        if django.VERSION >= (5, 1):
-            constraints = [
-                CheckConstraint(
-                    condition=Q(priority__range=(TASK_MIN_PRIORITY, TASK_MAX_PRIORITY)),
-                    name="priority_range",
-                )
-            ]
-        else:
-            constraints = [
-                CheckConstraint(
-                    check=Q(priority__range=(TASK_MIN_PRIORITY, TASK_MAX_PRIORITY)),
-                    name="priority_range",
-                )
-            ]
+        constraints = [
+            CheckConstraint(name="priority_range", **PRIORITY_CONSTRAINT_KWARGS)
+        ]
 
     @property
     def task(self) -> Task[P, T]:
@@ -161,11 +161,16 @@ class DBTaskResult(GenericBase[P, T], models.Model):
                 f"Task {self.id} does not point to a Task ({self.task_path})"
             )
 
-        return task.using(  # type: ignore[no-any-return]
-            priority=self.priority,
-            queue_name=self.queue_name,
-            run_after=None if self.run_after == get_date_max() else self.run_after,
-            backend=self.backend_name,
+        # A native `django.tasks` Task is accepted here by design (see
+        # `django_tasks.compat.TASK_CLASSES`), so narrow back to the declared type.
+        return cast(
+            "Task[P, T]",
+            task.using(
+                priority=self.priority,
+                queue_name=self.queue_name,
+                run_after=None if self.run_after == get_date_max() else self.run_after,
+                backend=self.backend_name,
+            ),
         )
 
     @property

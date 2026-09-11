@@ -85,7 +85,9 @@ class Job(BaseJob):
                 f"Task {self.id} does not point to a Task ({self.func_name})"
             )
 
-        return func  # type: ignore[no-any-return]
+        # A native `django.tasks` Task is accepted here by design (see
+        # `django_tasks.compat.TASK_CLASSES`), so narrow back to the declared type.
+        return cast("Task", func)
 
     @cached_property
     def task_result(self) -> TaskResult:

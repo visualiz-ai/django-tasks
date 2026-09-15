@@ -1,7 +1,8 @@
 import dataclasses
 from datetime import datetime
+from typing import Any
 
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from django.utils.module_loading import import_string
 
@@ -102,6 +103,63 @@ class TaskTestCase(SimpleTestCase):
         self.assertIsNone(test_tasks.noop_task.run_after)
         self.assertEqual(test_tasks.noop_task.using(run_after=now).run_after, now)
         self.assertIsNone(test_tasks.noop_task.run_after)
+
+    def test_using_job_timeout(self) -> None:
+        self.assertIsNone(test_tasks.noop_task.job_timeout)
+
+        bounded_task = test_tasks.noop_task.using(job_timeout=5)
+
+        self.assertEqual(bounded_task.job_timeout, 5)
+
+        # Everything else is carried over untouched.
+        self.assertIs(bounded_task.func, test_tasks.noop_task.func)
+        self.assertEqual(bounded_task.priority, test_tasks.noop_task.priority)
+        self.assertEqual(bounded_task.queue_name, test_tasks.noop_task.queue_name)
+        self.assertEqual(bounded_task.backend, test_tasks.noop_task.backend)
+        self.assertEqual(
+            bounded_task.enqueue_on_commit, test_tasks.noop_task.enqueue_on_commit
+        )
+        self.assertEqual(bounded_task.takes_context, test_tasks.noop_task.takes_context)
+        self.assertIsNone(bounded_task.run_after)
+
+        # The original Task is unchanged.
+        self.assertIsNone(test_tasks.noop_task.job_timeout)
+
+        # ...and `job_timeout` survives a later `using()`.
+        self.assertEqual(bounded_task.using(priority=10).job_timeout, 5)
+
+    def test_invalid_job_timeout(self) -> None:
+        job_timeouts: list[Any] = [0, -1, "5", 3.5, True]
+
+        for job_timeout in job_timeouts:
+            with self.subTest(job_timeout):
+                with self.assertRaisesMessage(
+                    InvalidTaskError,
+                    "job_timeout must be a positive whole number of seconds",
+                ):
+                    test_tasks.noop_task.using(job_timeout=job_timeout)
+
+        self.assertEqual(test_tasks.noop_task.using(job_timeout=1).job_timeout, 1)
+
+    def test_backend_without_job_timeout_support_ignores_it(self) -> None:
+        # Neither the dummy nor the immediate backend has a per-job bound: they
+        # accept a Task carrying one, and run it as they always would. A caller
+        # which needs the bound enforced has to ask.
+        self.assertFalse(default_task_backend.supports_job_timeout)
+        self.assertFalse(task_backends["immediate"].supports_job_timeout)
+
+        result = test_tasks.noop_task.using(job_timeout=5).enqueue()
+
+        self.assertEqual(result.status, TaskResultStatus.READY)
+        self.assertEqual(result.task.job_timeout, 5)
+        self.assertEqual(default_task_backend.results, [result])  # type:ignore[attr-defined]
+
+        immediate_result = test_tasks.noop_task.using(
+            backend="immediate", job_timeout=5
+        ).enqueue()
+
+        self.assertEqual(immediate_result.status, TaskResultStatus.SUCCEEDED)
+        self.assertEqual(immediate_result.task.job_timeout, 5)
 
     def test_using_unknown_backend(self) -> None:
         self.assertEqual(test_tasks.noop_task.backend, "default")
@@ -314,3 +372,25 @@ class TaskTestCase(SimpleTestCase):
             "Task takes context but does not have a first argument of 'context'",
         ):
             task(takes_context=True)(test_tasks.calculate_meaning_of_life.func)  # type: ignore[arg-type]
+
+
+@override_settings(
+    TASKS={
+        "default": {"BACKEND": "django_tasks.backends.database.DatabaseBackend"},
+    }
+)
+class DatabaseBackendJobTimeoutTestCase(TransactionTestCase):
+    def test_database_backend_ignores_job_timeout(self) -> None:
+        """
+        The database backend has no per-job timeout: enqueueing a Task which
+        declares one works, and the bound simply isn't stored.
+        """
+        self.assertFalse(default_task_backend.supports_job_timeout)
+
+        result = test_tasks.noop_task.using(job_timeout=5).enqueue()
+
+        self.assertEqual(result.status, TaskResultStatus.READY)
+        self.assertIsNone(result.task.job_timeout)
+
+        # The Task really was stored, rather than rejected.
+        self.assertEqual(default_task_backend.get_result(result.id).id, result.id)

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Iterable
 from importlib.metadata import version
 from types import TracebackType
@@ -6,10 +7,11 @@ from typing import Any, TypeVar, cast
 import django_rq
 from django.apps import apps
 from django.core.checks import messages
-from django.core.exceptions import SuspiciousOperation
+from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.db import transaction
 from django.utils.functional import cached_property
 from redis.client import Redis
+from rq import Worker as BaseWorker
 from rq.defaults import UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
 from rq.exceptions import NoSuchJobError
 from rq.job import Callback, JobStatus
@@ -32,6 +34,8 @@ from django_tasks.compat import TASK_CLASSES
 from django_tasks.exceptions import TaskResultDoesNotExist
 from django_tasks.signals import task_enqueued, task_finished, task_started
 from django_tasks.utils import get_module_path, get_random_id
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -81,7 +85,9 @@ class Job(BaseJob):
                 f"Task {self.id} does not point to a Task ({self.func_name})"
             )
 
-        return func  # type: ignore[no-any-return]
+        # A native `django.tasks` Task is accepted here by design (see
+        # `django_tasks.compat.TASK_CLASSES`), so narrow back to the declared type.
+        return cast("Task", func)
 
     @cached_property
     def task_result(self) -> TaskResult:
@@ -190,10 +196,53 @@ def success_callback(job: Job, connection: Redis | None, result: Any) -> None:
     task_finished.send(type(task_result.task.get_backend()), task_result=task_result)
 
 
+class Worker(BaseWorker):
+    """
+    An RQ worker which reports the jobs whose work horse it kills.
+
+    A job's `timeout` is enforced in two stages, and only the first of them runs
+    the job's callbacks. `perform_job` raises `JobTimeoutException` into the
+    running thread at `timeout` seconds, which `failed_callback` above sees; but
+    a job which never yields to the interpreter is instead SIGKILLed by
+    `monitor_work_horse` once it has been working for `timeout + 60` seconds,
+    and a killed horse runs no callback. `rq` records the failure from the
+    parent process, so `get_result()` reports `FAILED` either way, but
+    `task_finished` is only sent for the first.
+
+    This worker sends it for the second as well, so a consumer which handles
+    task failures through the signal sees killed jobs too. Use it with:
+
+        ./manage.py rqworker --worker-class django_tasks.backends.rq.Worker
+    """
+
+    job_class = Job
+
+    def handle_work_horse_killed(
+        self, job: BaseJob, retpid: int, ret_val: int, rusage: Any
+    ) -> None:
+        super().handle_work_horse_killed(job, retpid, ret_val, rusage)  # type:ignore[no-untyped-call]
+
+        try:
+            task_result = cast(Job, job).task_result
+
+            object.__setattr__(task_result, "status", TaskResultStatus.FAILED)
+
+            task_finished.send(
+                type(task_result.task.get_backend()), task_result=task_result
+            )
+        except Exception:
+            # The worker has already lost a horse: whatever a receiver (or a job
+            # which doesn't point at a Task) does here, it keeps working.
+            logger.exception(
+                "Unable to report the killed work horse for job %s", job.id
+            )
+
+
 class RQBackend(BaseTaskBackend):
     supports_async_task = True
     supports_get_result = True
     supports_defer = True
+    supports_job_timeout = True
 
     def __init__(self, alias: str, params: dict) -> None:
         super().__init__(alias, params)
@@ -232,6 +281,10 @@ class RQBackend(BaseTaskBackend):
             kwargs=kwargs,
             job_id=task_result.id,
             status=JobStatus.SCHEDULED if task.run_after else JobStatus.QUEUED,
+            # `None` leaves RQ to apply the queue's own default timeout, and is
+            # also what a `django.tasks.base.Task` (which has no `job_timeout`)
+            # gets.
+            timeout=getattr(task, "job_timeout", None),
             on_failure=Callback(failed_callback),
             on_success=Callback(success_callback),
             meta={"backend_name": self.alias},
@@ -260,12 +313,14 @@ class RQBackend(BaseTaskBackend):
         return django_rq.queues.get_queues(*self.queues, job_class=Job)  # type: ignore[no-any-return,no-untyped-call]
 
     def _get_default_task_queue_name(self) -> str:
-        task_queue_name = None
-        for task_queue_name in self.queues:
-            break
+        # `self.queues` is a set, so "the first one" is whichever the set
+        # yields first - the same choice the previous for/break made.
+        task_queue_name = next(iter(self.queues), None)
 
-        assert task_queue_name is not None, "No queues configured for RQ backend"
-        return task_queue_name
+        if task_queue_name is None:
+            raise ImproperlyConfigured("No queues configured for RQ backend")
+
+        return str(task_queue_name)
 
     def _get_job(self, result_id: str) -> Job | None:
         default_task_queue_name = self._get_default_task_queue_name()

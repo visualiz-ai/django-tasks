@@ -76,6 +76,14 @@ modified_task = calculate_meaning_of_life.using(priority=10)
 
 In addition to the above attributes, `run_after` can be passed to specify a specific time the task should run.
 
+`job_timeout` can also be passed to limit how long the task is allowed to run for, in seconds:
+
+```python
+bounded_task = calculate_meaning_of_life.using(job_timeout=30)
+```
+
+If it's not set, the backend's own default applies. Backends which have no concept of a per-task timeout (the database and immediate backends) accept a task carrying one and silently ignore it, so check `supports_job_timeout` (see [Backend introspecting](#backend-introspecting)) before relying on the bound. How firm the bound is depends on the backend - see [the RQ backend's job timeout](#job-timeout) for what it means there.
+
 #### Task context
 
 Sometimes the running task may need to know context about how it was enqueued. To receive the task context as an argument to your task function, pass `takes_context` to the decorator and ensure the task takes a `context` as the first argument.
@@ -250,6 +258,7 @@ Because `django-tasks` enables support for multiple different backends, those ba
 - `supports_async_task`: Can coroutines be enqueued?
 - `supports_get_result`: Can results be retrieved after the fact (from **any** thread / process)?
 - `supports_priority`: Can tasks be executed in a given priority order?
+- `supports_job_timeout`: Is a task's `job_timeout` enforced? Backends which don't support it accept a task carrying one and ignore it, so this is the only way to tell an enforced bound from a dropped one.
 
 ```python
 from django_tasks import default_task_backend
@@ -293,6 +302,25 @@ To use `rq` with `django-tasks`, a custom `Job` class must be used. This can be 
 ```shell
 ./manage.py rqworker --job-class django_tasks.backends.rq.Job
 ```
+
+### Job timeout
+
+`task.job_timeout` is passed to `rq` as the job's `timeout`. Tasks which don't set one get the queue's `DEFAULT_TIMEOUT` (from `RQ_QUEUES`), and failing that `rq`'s own default of 180 seconds.
+
+The bound is not a hard kill at `job_timeout` seconds. `rq` enforces it in two stages:
+
+- **An interrupt at `job_timeout` seconds**, which is cooperative. The worker runs the job inside its death penalty, which raises `JobTimeoutException` _into the thread running the job_ - through `signal.alarm` (`UnixSignalDeathPenalty`), or an asynchronous exception from a timer thread (`TimerDeathPenalty`, the default where there's no `SIGALRM`). Either way the exception is only delivered once the interpreter regains control, so a job blocked in a non-interruptible C call - a long-running database query, say - keeps going past its bound. When the exception is delivered, the job's failure callback runs, so `task_finished` is sent and the result is `FAILED`.
+- **A `SIGKILL` at `job_timeout + 60` seconds**, on the forking worker (`rq.Worker`) only. Its `monitor_work_horse` kills the work horse once it has been working longer than `job.timeout + 60`. The horse dies without running any callback, so `task_finished` is **not** sent; `rq` records the failure from the parent process, so `get_result()` still reports `FAILED`. `SimpleWorker` and `SpawnWorker` don't fork a horse, and so have no such backstop at all.
+
+In other words, `job_timeout=50` means "50 seconds if the job yields to the interpreter, otherwise 110 seconds on a forking worker".
+
+To have `task_finished` sent for killed jobs too, run the worker class this backend provides:
+
+```shell
+./manage.py rqworker --job-class django_tasks.backends.rq.Job --worker-class django_tasks.backends.rq.Worker
+```
+
+It extends `rq.Worker` to send `task_finished` with a `FAILED` result when it kills a work horse, so a consumer which responds to failures through the signal sees those as well. As with `rq`'s own failure callback, the result carries no errors at that point - `rq` writes the failure result afterwards.
 
 ### Priorities
 

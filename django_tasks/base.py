@@ -82,6 +82,14 @@ class Task(Generic[P, T]):
     run_after: datetime | None
     """The earliest this Task will run"""
 
+    job_timeout: int | None = None
+    """
+    The maximum number of seconds the backend lets the job run for.
+
+    `None` means the backend's queue default is used. Backends which have no
+    concept of a per-job timeout ignore this.
+    """
+
     enqueue_on_commit: bool | None
     """
     Whether the Task will be enqueued when the current transaction commits,
@@ -110,6 +118,7 @@ class Task(Generic[P, T]):
         queue_name: str | None = None,
         run_after: datetime | None = None,
         backend: str | None = None,
+        job_timeout: int | None = None,
     ) -> Self:
         """
         Create a new Task with modified defaults.
@@ -125,6 +134,8 @@ class Task(Generic[P, T]):
             changes["run_after"] = run_after
         if backend is not None:
             changes["backend"] = backend
+        if job_timeout is not None:
+            changes["job_timeout"] = job_timeout
 
         return replace(self, **changes)
 

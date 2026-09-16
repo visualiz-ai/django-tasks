@@ -14,15 +14,17 @@ from django.urls import reverse
 from django.utils import timezone
 from fakeredis import FakeRedis, FakeStrictRedis
 from rq.defaults import UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
-from rq.job import JobStatus
+from rq.exceptions import StopRequested
+from rq.job import Callback, JobStatus
 from rq.queue import Queue
 from rq.timeouts import TimerDeathPenalty
 
 from django_tasks import TaskResultStatus, default_task_backend, task_backends
-from django_tasks.backends.rq import Job, RQBackend, Worker
+from django_tasks.backends.rq import Job, RQBackend, Worker, stopped_callback
 from django_tasks.base import Task, TaskResult
 from django_tasks.exceptions import InvalidTaskError, TaskResultDoesNotExist
 from django_tasks.signals import task_finished
+from django_tasks.utils import get_module_path
 from tests import tasks as test_tasks
 
 
@@ -245,6 +247,156 @@ class RQBackendTestCase(TransactionTestCase):
 
         self.assertIn("Unable to report the killed work horse", logs.output[0])
         self.assertEqual(finished, [])
+
+    def test_enqueue_registers_the_stopped_callback(self) -> None:
+        """
+        Every enqueued job carries the stopped callback, alongside the success
+        and failure ones.
+        """
+        result = test_tasks.noop_task.enqueue()
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        # Fetched back out of Redis, so this is the name RQ persisted and the
+        # one a worker in another process will import.
+        self.assertEqual(job._stopped_callback_name, get_module_path(stopped_callback))
+        self.assertIs(job.stopped_callback, stopped_callback)
+
+    def test_stopped_job_sends_task_finished(self) -> None:
+        """
+        `rq stop-job` reaches a job through its *stopped* callback. Neither the
+        failure callback nor `Worker.handle_work_horse_killed` runs for it, so
+        this callback is the only thing that can report it.
+        """
+        result = test_tasks.noop_task.enqueue()
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        finished = self.collect_task_finished()
+
+        with self.assertLogs("django_tasks", level="ERROR") as logs:
+            # As `monitor_work_horse` calls it, having killed the horse.
+            # (`TimerDeathPenalty` for the same reason `run_worker` uses it.)
+            job.execute_stopped_callback(TimerDeathPenalty)
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].id, result.id)
+        self.assertEqual(finished[0].status, TaskResultStatus.FAILED)
+        self.assertIsNotNone(finished[0].finished_at)
+
+        # The reason is recorded as a `StopRequested`, so a consumer can tell a
+        # deliberate stop from a crash.
+        self.assertEqual(len(finished[0].errors), 1)
+        self.assertIs(finished[0].errors[0].exception_class, StopRequested)
+        self.assertIn("stopped by an operator", finished[0].errors[0].traceback)
+
+        # The library's own `task_finished` receiver saw it, too.
+        self.assertIn("state=FAILED", logs.output[0])
+
+    def test_monitor_work_horse_reports_a_stopped_job(self) -> None:
+        """
+        RQ's stopped branch end to end, with only the kill itself stubbed out.
+
+        `monitor_work_horse` reaps the horse, notices the job is the one
+        `rq stop-job` asked for, and takes a branch which runs the stopped
+        callback and `handle_job_failure` - never reaching the
+        `handle_work_horse_killed` call below it. Forking a horse only to
+        SIGKILL it would make this test a fork test; what it needs from the
+        horse is that `wait_for_horse` reports one which died on a signal.
+        """
+        result = test_tasks.noop_task.enqueue()
+
+        queue = django_rq.get_queue("default", job_class=Job)
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        worker = Worker([queue], connection=queue.connection, prepare_for_work=False)
+        # Use timer death penalty to support Windows
+        worker.death_penalty_class = TimerDeathPenalty
+        # HACK: Work around fakeredis not supporting `CLIENT LIST`
+        worker.hostname = "example-hostname"
+        worker.pid = os.getpid()
+
+        # What `rq`'s stop-job command handler leaves behind on the worker.
+        worker._stopped_job_id = job.id
+
+        finished = self.collect_task_finished()
+
+        with (
+            patch.object(
+                worker, "wait_for_horse", return_value=(os.getpid(), -9, None)
+            ),
+            patch.object(worker, "handle_work_horse_killed") as handle_killed,
+            self.assertLogs("rq.worker", level="WARNING") as rq_logs,
+            self.assertLogs("django_tasks", level="ERROR") as logs,
+        ):
+            worker.monitor_work_horse(job, queue)
+
+        self.assertIn("stopped by user", rq_logs.output[0])
+        # The killed-horse hook is in the branch *below* this one.
+        handle_killed.assert_not_called()
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].id, result.id)
+        self.assertEqual(finished[0].status, TaskResultStatus.FAILED)
+        self.assertIn("state=FAILED", logs.output[0])
+
+        # And `rq`'s own bookkeeping agrees, so a consumer which asks later
+        # gets the same answer the signal carried.
+        self.assertEqual(job.get_status(), JobStatus.STOPPED)
+
+        fetched = default_task_backend.get_result(result.id)
+        self.assertEqual(fetched.status, TaskResultStatus.FAILED)
+        self.assertEqual(
+            [error.exception_class_path for error in fetched.errors],
+            [get_module_path(StopRequested)],
+        )
+
+    def test_stopped_callback_failure_does_not_reach_the_worker(self) -> None:
+        """
+        The stopped callback runs in the worker itself, and
+        `execute_stopped_callback` re-raises: were it to let an exception out,
+        `monitor_work_horse` would skip the `handle_job_failure` on its next
+        line - leaving the job STARTED, the state the callback exists to clear
+        - and then unwind into `Worker.work`. So it reports its own failures.
+
+        A job which doesn't point at a Task stands in for any of them: building
+        its `task_result` raises, as it does for the killed-horse hook above.
+        """
+        queue = django_rq.get_queue("default", job_class=Job)
+        job = queue.enqueue_job(
+            queue.create_job(
+                "tests.tasks.noop_task", on_stopped=Callback(stopped_callback)
+            )
+        )
+
+        worker = Worker([queue], connection=queue.connection, prepare_for_work=False)
+        worker.death_penalty_class = TimerDeathPenalty
+        # HACK: Work around fakeredis not supporting `CLIENT LIST`
+        worker.hostname = "example-hostname"
+        worker.pid = os.getpid()
+        worker._stopped_job_id = job.id
+
+        finished = self.collect_task_finished()
+
+        with (
+            patch.object(
+                worker, "wait_for_horse", return_value=(os.getpid(), -9, None)
+            ),
+            self.assertLogs("rq.worker", level="WARNING"),
+            self.assertLogs("django_tasks.backends.rq", level="ERROR") as logs,
+        ):
+            # Nothing raised: `monitor_work_horse` ran to the end.
+            worker.monitor_work_horse(job, queue)
+
+        self.assertIn("Unable to report the stopped job", logs.output[0])
+        self.assertEqual(finished, [])
+
+        # `handle_job_failure` still ran, so the job is not left STARTED.
+        self.assertEqual(job.get_status(), JobStatus.STOPPED)
 
     def test_invalid_job_timeout(self) -> None:
         job_timeouts: list[Any] = [0, -1, "5"]

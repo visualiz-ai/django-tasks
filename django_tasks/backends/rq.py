@@ -9,11 +9,12 @@ from django.apps import apps
 from django.core.checks import messages
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.db import transaction
+from django.utils import timezone
 from django.utils.functional import cached_property
 from redis.client import Redis
 from rq import Worker as BaseWorker
 from rq.defaults import UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
-from rq.exceptions import NoSuchJobError
+from rq.exceptions import NoSuchJobError, StopRequested
 from rq.job import Callback, JobStatus
 from rq.job import Job as BaseJob
 from rq.registry import ScheduledJobRegistry
@@ -196,6 +197,76 @@ def success_callback(job: Job, connection: Redis | None, result: Any) -> None:
     task_finished.send(type(task_result.task.get_backend()), task_result=task_result)
 
 
+#: What `stopped_callback` records as the reason, in the `TaskError` it appends
+#: and (for a later `get_result`) in the job's own meta.
+STOPPED_TRACEBACK = (
+    "Job stopped by an operator (`rq stop-job`); the work horse was terminated."
+)
+
+
+def stopped_callback(job: Job, connection: Redis | None) -> None:
+    """
+    Report a job an operator stopped (`rq stop-job`) as a terminal failure.
+
+    RQ stops a job by killing its work horse, and `monitor_work_horse` then
+    takes a branch of its own for it: `self._stopped_job_id == job.id` runs
+    this callback and `handle_job_failure`, and returns -- so neither the
+    job's failure callback (the horse is already gone) nor
+    `handle_work_horse_killed` (the branch below it) ever runs. Without an
+    `on_stopped` callback a stopped job therefore sends no `task_finished` at
+    all, and a consumer which learns about failures through that signal waits
+    for a job which is never coming back.
+
+    The result RQ goes on to persist is `STOPPED`, which
+    `RQ_STATUS_TO_RESULT_STATUS` already reads as `FAILED`; this sends the
+    same conclusion through the signal, and records why.
+    """
+    try:
+        # Smuggle the exception class through meta, the way `failed_callback`
+        # does, so the `Result.Type.FAILED` record `handle_job_failure` writes
+        # immediately after this is reported with the same cause by a later
+        # `get_result`.
+        job.meta.setdefault("_django_tasks_exceptions", []).append(
+            get_module_path(StopRequested)
+        )
+        job.save_meta()  # type: ignore[no-untyped-call]
+
+        task_result = job.task_result
+
+        object.__setattr__(task_result, "status", TaskResultStatus.FAILED)
+
+        # RQ's stopped branch, unlike the killed-horse one below it, doesn't
+        # set `job.ended_at` before failing the job, so there is nothing for
+        # `task_result.finished_at` to have been built from.
+        if task_result.finished_at is None:
+            object.__setattr__(task_result, "finished_at", timezone.now())
+
+        task_result.errors.append(
+            TaskError(
+                exception_class_path=get_module_path(StopRequested),
+                # There is no traceback: nothing raised in this process, and
+                # the process which was running the job is gone.
+                traceback=STOPPED_TRACEBACK,
+            )
+        )
+
+        task_finished.send(
+            type(task_result.task.get_backend()), task_result=task_result
+        )
+    except Exception:
+        # Unlike the failure and success callbacks -- which `rq` runs inside
+        # the work horse, a process it is about to discard -- this one runs in
+        # the worker itself, and `Job.execute_stopped_callback` re-raises what
+        # it catches. An exception escaping here would skip the
+        # `handle_job_failure` call on the very next line of
+        # `monitor_work_horse`, leaving the job STARTED and the consumer
+        # waiting -- precisely the state this callback exists to clear -- and
+        # would then unwind out of `execute_job` into `Worker.work`, taking
+        # the worker down with it. So, as in `handle_work_horse_killed` below:
+        # report it and let `rq` carry on failing the job.
+        logger.exception("Unable to report the stopped job %s", job.id)
+
+
 class Worker(BaseWorker):
     """
     An RQ worker which reports the jobs whose work horse it kills.
@@ -213,6 +284,12 @@ class Worker(BaseWorker):
     task failures through the signal sees killed jobs too. Use it with:
 
         ./manage.py rqworker --worker-class django_tasks.backends.rq.Worker
+
+    A job stopped deliberately (`rq stop-job`) is a third case, and doesn't
+    need this worker: `monitor_work_horse` takes a separate branch for it,
+    which runs the job's *stopped* callback and never reaches
+    `handle_work_horse_killed`. `RQBackend.enqueue` registers
+    `stopped_callback` for that, so those jobs report themselves.
     """
 
     job_class = Job
@@ -287,6 +364,7 @@ class RQBackend(BaseTaskBackend):
             timeout=getattr(task, "job_timeout", None),
             on_failure=Callback(failed_callback),
             on_success=Callback(success_callback),
+            on_stopped=Callback(stopped_callback),
             meta={"backend_name": self.alias},
         )
 

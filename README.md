@@ -322,6 +322,14 @@ To have `task_finished` sent for killed jobs too, run the worker class this back
 
 It extends `rq.Worker` to send `task_finished` with a `FAILED` result when it kills a work horse, so a consumer which responds to failures through the signal sees those as well. As with `rq`'s own failure callback, the result carries no errors at that point - `rq` writes the failure result afterwards.
 
+### Stopped jobs
+
+A job stopped deliberately (`rq stop-job`, or `send_stop_job_command`) is killed the same way, but `monitor_work_horse` handles it in a branch of its own: it runs the job's **stopped** callback and fails the job, without ever reaching `handle_work_horse_killed`. Neither the failure callback nor the worker above would report it.
+
+This backend therefore registers a stopped callback on every job it enqueues, which sends `task_finished` with a `FAILED` result carrying a `rq.exceptions.StopRequested` error. So a stopped job is reported like any other failure, on any forking worker - the worker class above is not needed for it.
+
+That callback runs in the worker's own process, where `rq` re-raises anything it lets out, so it reports its own failures rather than raising them: a receiver which blows up cannot stop `rq` failing the job, nor take the worker down.
+
 ### Priorities
 
 `rq` has no native concept of priorities - instead relying on workers to define which queues they should pop tasks from in order. Therefore, `task.priority` has little effect on execution priority.

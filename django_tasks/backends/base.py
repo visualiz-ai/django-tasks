@@ -118,6 +118,17 @@ class BaseTaskBackend(metaclass=ABCMeta):
                 "job_timeout must be a positive whole number of seconds."
             )
 
+        # Same story as `job_timeout`: absent on `django.tasks.base.Task`.
+        for attribute in ("queue_ttl", "failure_ttl"):
+            value = getattr(task, attribute, None)
+
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise InvalidTaskError(
+                    f"{attribute} must be a positive whole number of seconds."
+                )
+
         if not self.supports_defer and task.run_after is not None:
             raise InvalidTaskError("Backend does not support run_after.")
 

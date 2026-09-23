@@ -141,6 +141,48 @@ class TaskTestCase(SimpleTestCase):
 
         self.assertEqual(test_tasks.noop_task.using(job_timeout=1).job_timeout, 1)
 
+    def test_using_retention(self) -> None:
+        self.assertIsNone(test_tasks.noop_task.queue_ttl)
+        self.assertIsNone(test_tasks.noop_task.failure_ttl)
+
+        short_lived_task = test_tasks.noop_task.using(queue_ttl=3600, failure_ttl=1800)
+
+        self.assertEqual(short_lived_task.queue_ttl, 3600)
+        self.assertEqual(short_lived_task.failure_ttl, 1800)
+
+        # Neither disturbs the run bound, which is a separate question.
+        self.assertIsNone(short_lived_task.job_timeout)
+
+        # Everything else is carried over untouched.
+        self.assertIs(short_lived_task.func, test_tasks.noop_task.func)
+        self.assertEqual(short_lived_task.priority, test_tasks.noop_task.priority)
+        self.assertEqual(short_lived_task.queue_name, test_tasks.noop_task.queue_name)
+        self.assertEqual(short_lived_task.backend, test_tasks.noop_task.backend)
+
+        # The original Task is unchanged.
+        self.assertIsNone(test_tasks.noop_task.queue_ttl)
+        self.assertIsNone(test_tasks.noop_task.failure_ttl)
+
+        # ...and both survive a later `using()`.
+        later = short_lived_task.using(priority=10)
+        self.assertEqual(later.queue_ttl, 3600)
+        self.assertEqual(later.failure_ttl, 1800)
+
+    def test_invalid_retention(self) -> None:
+        values: list[Any] = [0, -1, "5", 3.5, True]
+
+        for attribute in ("queue_ttl", "failure_ttl"):
+            for value in values:
+                with self.subTest(attribute=attribute, value=value):
+                    with self.assertRaisesMessage(
+                        InvalidTaskError,
+                        f"{attribute} must be a positive whole number of seconds",
+                    ):
+                        test_tasks.noop_task.using(**{attribute: value})
+
+        self.assertEqual(test_tasks.noop_task.using(queue_ttl=1).queue_ttl, 1)
+        self.assertEqual(test_tasks.noop_task.using(failure_ttl=1).failure_ttl, 1)
+
     def test_backend_without_job_timeout_support_ignores_it(self) -> None:
         # Neither the dummy nor the immediate backend has a per-job bound: they
         # accept a Task carrying one, and run it as they always would. A caller

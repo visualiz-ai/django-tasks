@@ -362,6 +362,10 @@ class RQBackend(BaseTaskBackend):
             # also what a `django.tasks.base.Task` (which has no `job_timeout`)
             # gets.
             timeout=getattr(task, "job_timeout", None),
+            # `None` for either is RQ's own default: no expiry at all for a
+            # queued job, and a year for a failed one.
+            ttl=getattr(task, "queue_ttl", None),
+            failure_ttl=getattr(task, "failure_ttl", None),
             on_failure=Callback(failed_callback),
             on_success=Callback(success_callback),
             on_stopped=Callback(stopped_callback),

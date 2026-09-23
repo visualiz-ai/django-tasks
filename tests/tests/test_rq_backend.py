@@ -180,6 +180,49 @@ class RQBackendTestCase(TransactionTestCase):
 
         self.assertEqual(job.timeout, queue._default_timeout)
 
+    def test_enqueue_task_with_retention(self) -> None:
+        result = test_tasks.noop_task.using(queue_ttl=3600, failure_ttl=1800).enqueue()
+
+        self.assertEqual(result.task.queue_ttl, 3600)
+        self.assertEqual(result.task.failure_ttl, 1800)
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        # Both survive `Queue.enqueue_job` and the round-trip through Redis.
+        self.assertEqual(job.ttl, 3600)
+        self.assertEqual(job.failure_ttl, 1800)
+
+    def test_enqueue_deferred_task_with_retention(self) -> None:
+        result = test_tasks.noop_task.using(
+            queue_ttl=3600,
+            failure_ttl=1800,
+            run_after=timezone.now() + timedelta(hours=1),
+        ).enqueue()
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        # ...and the `Queue.schedule_job` (run_after) path too.
+        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
+        self.assertEqual(job.ttl, 3600)
+        self.assertEqual(job.failure_ttl, 1800)
+
+    def test_enqueue_task_without_retention(self) -> None:
+        result = test_tasks.noop_task.enqueue()
+
+        self.assertIsNone(result.task.queue_ttl)
+        self.assertIsNone(result.task.failure_ttl)
+
+        job = cast(RQBackend, default_task_backend)._get_job(result.id)
+        assert job is not None
+
+        # RQ's own behaviour is unchanged for a task declaring neither: no
+        # expiry on the queued job, and `DEFAULT_FAILURE_TTL` (a year) applied
+        # by the failed job registry rather than stamped on the job.
+        self.assertIsNone(job.ttl)
+        self.assertIsNone(job.failure_ttl)
+
     def collect_task_finished(self) -> list[TaskResult]:
         """
         Collect the `task_result` of every `task_finished` sent from here on.

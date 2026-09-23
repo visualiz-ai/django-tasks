@@ -84,6 +84,14 @@ bounded_task = calculate_meaning_of_life.using(job_timeout=30)
 
 If it's not set, the backend's own default applies. Backends which have no concept of a per-task timeout (the database and immediate backends) accept a task carrying one and silently ignore it, so check `supports_job_timeout` (see [Backend introspecting](#backend-introspecting)) before relying on the bound. How firm the bound is depends on the backend - see [the RQ backend's job timeout](#job-timeout) for what it means there.
 
+`queue_ttl` and `failure_ttl` bound the job's lifetime either side of the run, in seconds:
+
+```python
+short_lived_task = calculate_meaning_of_life.using(queue_ttl=3600, failure_ttl=3600)
+```
+
+`queue_ttl` is how long the task may sit queued before it is discarded unrun - a bound on how long the *request* stays worth answering, as distinct from `job_timeout`, which bounds the run itself. `failure_ttl` is how long a failed task's record is kept. Both default to the backend's own behaviour, which for RQ is no expiry at all for a queued job and a year for a failed one; see [the RQ backend's retention](#retention). Backends with no separate queue or failure retention accept a task carrying either and ignore it.
+
 #### Task context
 
 Sometimes the running task may need to know context about how it was enqueued. To receive the task context as an argument to your task function, pass `takes_context` to the decorator and ensure the task takes a `context` as the first argument.
@@ -313,6 +321,16 @@ The bound is not a hard kill at `job_timeout` seconds. `rq` enforces it in two s
 - **A `SIGKILL` at `job_timeout + 60` seconds**, on the forking worker (`rq.Worker`) only. Its `monitor_work_horse` kills the work horse once it has been working longer than `job.timeout + 60`. The horse dies without running any callback, so `task_finished` is **not** sent; `rq` records the failure from the parent process, so `get_result()` still reports `FAILED`. `SimpleWorker` and `SpawnWorker` don't fork a horse, and so have no such backstop at all.
 
 In other words, `job_timeout=50` means "50 seconds if the job yields to the interpreter, otherwise 110 seconds on a forking worker".
+
+### Retention
+
+`task.queue_ttl` is passed to `rq` as the job's `ttl`, and `task.failure_ttl` as its `failure_ttl`.
+
+`ttl` bounds how long the job may stay queued: once it has waited that long, `rq` drops it rather than running it. Left unset it is `None`, which is no expiry at all, so a job nobody is waiting for any more is still run whenever a worker eventually reaches it.
+
+`failure_ttl` is how long the failed job's record is kept in the failed job registry. Left unset, `rq` falls back to `DEFAULT_FAILURE_TTL`, which is a year - so on a Redis shared with anything else, failures accumulate there for far longer than they are useful.
+
+Neither affects a job that is already running: `job_timeout` is the only bound on that.
 
 To have `task_finished` sent for killed jobs too, run the worker class this backend provides:
 

@@ -90,6 +90,25 @@ class Task(Generic[P, T]):
     concept of a per-job timeout ignore this.
     """
 
+    queue_ttl: int | None = None
+    """
+    The maximum number of seconds the job may sit queued before it is discarded
+    unrun.
+
+    This bounds how long the *request* stays worth answering, which is a
+    separate question from how long the job may run for once it starts
+    (`job_timeout`). `None` means the job waits indefinitely, which is the
+    backend default. Backends with no concept of a queued lifetime ignore this.
+    """
+
+    failure_ttl: int | None = None
+    """
+    The number of seconds a failed job's record is kept for.
+
+    `None` means the backend's own default, which for RQ is a year. Backends
+    which do not retain failed jobs separately ignore this.
+    """
+
     enqueue_on_commit: bool | None
     """
     Whether the Task will be enqueued when the current transaction commits,
@@ -119,6 +138,8 @@ class Task(Generic[P, T]):
         run_after: datetime | None = None,
         backend: str | None = None,
         job_timeout: int | None = None,
+        queue_ttl: int | None = None,
+        failure_ttl: int | None = None,
     ) -> Self:
         """
         Create a new Task with modified defaults.
@@ -136,6 +157,10 @@ class Task(Generic[P, T]):
             changes["backend"] = backend
         if job_timeout is not None:
             changes["job_timeout"] = job_timeout
+        if queue_ttl is not None:
+            changes["queue_ttl"] = queue_ttl
+        if failure_ttl is not None:
+            changes["failure_ttl"] = failure_ttl
 
         return replace(self, **changes)
 
